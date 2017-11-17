@@ -76,6 +76,7 @@ type headerIndex struct {
 // newHeaderIndex creates a new headerIndex given an already open database, and
 // a particular header type.
 func newHeaderIndex(db walletdb.DB, indexType HeaderType) (*headerIndex, error) {
+	fmt.Printf("new header indes: %T\n", db)
 	// As an initially step, we'll attempt to create all the buckets
 	// necessary for functioning of the index. If these buckets has already
 	// been created, then we can exit early.
@@ -88,6 +89,7 @@ func newHeaderIndex(db walletdb.DB, indexType HeaderType) (*headerIndex, error) 
 		return nil, err
 	}
 
+	fmt.Printf("got header index with tb %T\n", db)
 	return &headerIndex{
 		db:        db,
 		indexType: indexType,
@@ -168,6 +170,7 @@ func (h *headerIndex) addHeaders(batch headerBatch) error {
 		for _, header := range batch {
 			var heightBytes [4]byte
 			binary.BigEndian.PutUint32(heightBytes[:], header.height)
+			//fmt.Println("putting height bytes", hex.EncodeToString(heightBytes[:]))
 			err := rootBucket.Put(header.hash[:], heightBytes[:])
 			if err != nil {
 				return err
@@ -218,7 +221,9 @@ func (h *headerIndex) chainTip() (*chainhash.Hash, uint32, error) {
 	)
 
 	err := walletdb.View(h.db, func(tx walletdb.ReadTx) error {
+		//fmt.Println("reading bucket")
 		rootBucket := tx.ReadBucket(indexBucket)
+		//fmt.Println("got bucket", rootBucket)
 
 		var tipKey []byte
 
@@ -237,13 +242,17 @@ func (h *headerIndex) chainTip() (*chainhash.Hash, uint32, error) {
 		// Now that we have the particular tip key for this header
 		// type, we'll fetch the hash for this tip, then using that
 		// we'll fetch the height that corresponds to that hash.
+		//fmt.Println("getting tip key", string(tipKey))
 		tipHashBytes := rootBucket.Get(tipKey)
+		//fmt.Printf("got tiphashbytes %x\n", tipHashBytes)
 		tipHeightBytes := rootBucket.Get(tipHashBytes)
+		//fmt.Printf("got tipheightbytes %x\n", tipHeightBytes)
 
 		// With the height fetched, we can now populate our return
 		// parameters.
 		h, err := chainhash.NewHash(tipHashBytes)
 		if err != nil {
+			fmt.Println("err creating hash:", err)
 			return err
 		}
 		tipHash = h
@@ -252,6 +261,7 @@ func (h *headerIndex) chainTip() (*chainhash.Hash, uint32, error) {
 		return nil
 	})
 	if err != nil {
+		fmt.Println("error getting view", err)
 		return nil, 0, err
 	}
 
@@ -284,6 +294,7 @@ func (h *headerIndex) truncateIndex(newTip *chainhash.Hash, delete bool) error {
 		// from the database as the primary index (block headers) is
 		// being rolled back.
 		if delete {
+			fmt.Println("will delete")
 			prevTipHash := rootBucket.Get(tipKey)
 			if err := rootBucket.Delete(prevTipHash); err != nil {
 				return err

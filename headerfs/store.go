@@ -48,6 +48,7 @@ type headerStore struct {
 // file will be created as necessary.
 func newHeaderStore(db walletdb.DB, filePath string,
 	hType HeaderType) (*headerStore, error) {
+	fmt.Printf("new header store %T\n", db)
 
 	var flatFileName string
 	switch hType {
@@ -63,6 +64,7 @@ func newHeaderStore(db walletdb.DB, filePath string,
 
 	flatFileName = filepath.Join(filePath, flatFileName)
 
+	fmt.Println("flatfilename", flatFileName)
 	// We'll open the file, creating it if necessary and ensuring that all
 	// writes are actually appends to the end of the file.
 	fileFlags := os.O_RDWR | os.O_APPEND | os.O_CREATE
@@ -103,6 +105,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 
 	hStore, err := newHeaderStore(db, filePath, Block)
 	if err != nil {
+		fmt.Println("headerstore", err)
 		return nil, err
 	}
 
@@ -110,6 +113,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	// we need to initialize it with the first header or not.
 	fileInfo, err := hStore.file.Stat()
 	if err != nil {
+		fmt.Println("stat", err)
 		return nil, err
 	}
 
@@ -119,23 +123,25 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 
 	// If the size of the file is zero, then this means that we haven't yet
 	// written the initial genesis header to disk, so we'll do so now.
-	if fileInfo.Size() == 0 {
-		genesisHeader := BlockHeader{
-			BlockHeader: &netParams.GenesisBlock.Header,
-			Height:      0,
-		}
-		if err := bhs.WriteHeaders(genesisHeader); err != nil {
-			return nil, err
-		}
+	fmt.Println("filesize", fileInfo.Size())
 
-		return bhs, nil
+	genesisHeader := BlockHeader{
+		BlockHeader: &netParams.GenesisBlock.Header,
+		Height:      0,
 	}
+	if err := bhs.WriteHeaders(genesisHeader); err != nil {
+		fmt.Println("write header", err)
+		return nil, err
+	}
+
+	return bhs, nil
 
 	// As a final initialization step (if this isn't the first time), we'll
 	// ensure that the header tip within the flat files, is in sync with
 	// out database index.
 	tipHash, tipHeight, err := bhs.chainTip()
 	if err != nil {
+		fmt.Println("tip", err)
 		return nil, err
 	}
 
@@ -146,6 +152,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	// Using the file's current height, fetch the latest on-disk header.
 	latestFileHeader, err := bhs.readHeader(fileHeight)
 	if err != nil {
+		fmt.Println("read header", err)
 		return nil, err
 	}
 

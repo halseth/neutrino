@@ -624,27 +624,37 @@ func NewChainService(cfg Config) (*ChainService, error) {
 
 	s.FilterDB, err = filterdb.New(cfg.Database, cfg.ChainParams)
 	if err != nil {
+		fmt.Println("unable to create filterdb", err)
 		return nil, err
 	}
 
-	s.BlockHeaders, err = headerfs.NewBlockHeaderStore(cfg.DataDir,
-		cfg.Database, &cfg.ChainParams)
+	mDB, err := walletdb.Create("mdb", "dummmmm")
 	if err != nil {
+		return nil, err
+	}
+	fmt.Println("creating header store with db", mDB)
+	s.BlockHeaders, err = headerfs.NewBlockHeaderStore(cfg.DataDir,
+		mDB, &cfg.ChainParams)
+	if err != nil {
+		fmt.Println("unable to create blockheader", err)
 		return nil, err
 	}
 	s.RegFilterHeaders, err = headerfs.NewFilterHeaderStore(cfg.DataDir,
-		cfg.Database, headerfs.RegularFilter, &cfg.ChainParams)
+		mDB, headerfs.RegularFilter, &cfg.ChainParams)
 	if err != nil {
+		fmt.Println("unable to create headerstor", err)
 		return nil, err
 	}
 	s.ExtFilterHeaders, err = headerfs.NewFilterHeaderStore(cfg.DataDir,
-		cfg.Database, headerfs.ExtendedFilter, &cfg.ChainParams)
+		mDB, headerfs.ExtendedFilter, &cfg.ChainParams)
 	if err != nil {
+		fmt.Println("unable to create ext header store", err)
 		return nil, err
 	}
 
 	bm, err := newBlockManager(&s)
 	if err != nil {
+		fmt.Println("unable to create blockmanager", err)
 		return nil, err
 	}
 	s.blockManager = bm
@@ -739,6 +749,9 @@ func NewChainService(cfg Config) (*ChainService, error) {
 // BestSnapshot retrieves the most recent block's height and hash.
 func (s *ChainService) BestSnapshot() (*waddrmgr.BlockStamp, error) {
 	bestHeader, bestHeight, err := s.BlockHeaders.ChainTip()
+	//	if bestHeight == 10546 {
+	//		panic("aaah")
+	//	}
 	if err != nil {
 		return nil, err
 	}
