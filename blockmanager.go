@@ -1808,16 +1808,6 @@ func (b *blockManager) BlockHeadersSynced() bool {
 	return b.syncPeer.LastBlock() >= b.syncPeer.StartingHeight()
 }
 
-// FilterHeaderTip returns the current height of the filter header chain tip.
-//
-// NOTE: This method is safe for concurrent access.
-func (b *blockManager) FilterHeaderTip() uint32 {
-	b.newFilterHeadersMtx.RLock()
-	defer b.newFilterHeadersMtx.RUnlock()
-
-	return b.filterHeaderTip
-}
-
 // SynchronizeFilterHeaders allows the caller to execute a function closure
 // that depends on synchronization with the current set of filter headers. This
 // allows the caller to execute an action that depends on the current filter
