@@ -732,7 +732,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	}
 
 	s.utxoScanner = NewUtxoScanner(&UtxoScannerConfig{
-		BestSnapshot:       s.BestSnapshot,
+		BestSnapshot:       s.BestReadyBlock,
 		GetBlockHash:       s.GetBlockHash,
 		BlockFilterMatches: s.blockFilterMatches,
 		GetBlock:           s.GetBlock,
