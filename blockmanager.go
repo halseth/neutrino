@@ -1821,16 +1821,6 @@ func (b *blockManager) SynchronizeFilterHeaders(f func(uint32) error) error {
 	return f(b.filterHeaderTip)
 }
 
-// BlockHeaderTip returns the current height of the block header chain tip.
-//
-// NOTE: This method is safe for concurrent access.
-func (b *blockManager) BlockHeaderTip() uint32 {
-	b.newHeadersMtx.RLock()
-	defer b.newHeadersMtx.RUnlock()
-
-	return b.headerTip
-}
-
 // QueueInv adds the passed inv message and peer to the block handling queue.
 func (b *blockManager) QueueInv(inv *wire.MsgInv, sp *ServerPeer) {
 	// No channel handling here because peers do not need to block on inv
