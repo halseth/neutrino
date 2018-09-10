@@ -239,7 +239,7 @@ func (s *ChainService) rescan(options ...RescanOption) error {
 		curStamp  waddrmgr.BlockStamp
 	)
 	if ro.startBlock == nil {
-		bs, err := s.BestSnapshot()
+		bs, err := s.BestReadyBlock()
 		if err != nil {
 			return err
 		}
