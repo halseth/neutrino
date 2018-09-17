@@ -501,8 +501,24 @@ func (b *blockManager) cfHandler() {
 				goodCheckpoints, store, fType,
 			)
 
-			log.Infof("Fully caught up with cfheaders at height "+
-				"%v, waiting at tip for new blocks", lastHeight)
+		}(fType, storeLookup)
+	}
+	wg.Wait()
+
+	log.Infof("Fully caught up with cfheaders at height "+
+		"%v, waiting at tip for new blocks", lastHeight)
+
+	wg.Add(len(filterTypes))
+	for fType, storeLookup := range filterTypes {
+		// Launch a goroutine to get all of the filter headers for this
+		// filter type.
+		go func(fType wire.FilterType, storeLookup func(
+			s *ChainService) *headerfs.FilterHeaderStore) {
+
+			defer wg.Done()
+
+			// Get the header store for this filter type.
+			store := storeLookup(b.server)
 
 			// Now that we've been fully caught up to the tip of
 			// the current header chain, we'll wait here for a
