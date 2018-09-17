@@ -395,15 +395,23 @@ func (b *blockManager) cfHandler() {
 		b.wg.Done()
 	}()
 
-	log.Infof("Waiting for block headers to sync, then will start " +
-		"cfheaders sync...")
+	b.newFilterHeadersMtx.RLock()
+	filterHeaderTip := b.filterHeaderTip
+	filterHeaderTipHash := b.filterHeaderTipHash
+	b.newFilterHeadersMtx.RUnlock()
 
-	// We'll wait until the main header sync is mostly finished before we
-	// actually start to sync the set of cfheaders. We do this to speed up
-	// the sync, as the check pointed sync is faster, then fetching each
-	// header from each peer during the normal "at tip" syncing.
+waitForHeaders:
+	// We'll wait until the main header sync is either finished or the
+	// filter headers are lagging at least a checkpoint interval behind the
+	// block headers, before we actually start to sync the set of
+	// cfheaders. We do this to speed up the sync, as the check pointed
+	// sync is faster, than fetching each header from each peer during the
+	// normal "at tip" syncing.
+	log.Infof("Waiting for block headers to sync, then will start "+
+		"cfheaders sync from height %v...", filterHeaderTip)
+
 	b.newHeadersSignal.L.Lock()
-	for !b.IsCurrent() {
+	for !b.IsCurrent() && filterHeaderTip+wire.CFCheckptInterval > b.headerTip {
 		b.newHeadersSignal.Wait()
 
 		// While we're awake, we'll quickly check to see if we need to
@@ -427,8 +435,9 @@ func (b *blockManager) cfHandler() {
 	}
 	lastHash := lastHeader.BlockHash()
 
-	log.Infof("Starting cfheaders sync at block_height=%v, hash=%v", lastHeight,
-		lastHeader.BlockHash())
+	log.Infof("Starting cfheaders sync from (block_height=%v, hash=%v) "+
+		"to (block_height=%v, hash=%v)", filterHeaderTip,
+		filterHeaderTipHash, lastHeight, lastHeader.BlockHash())
 
 	// We'll sync the headers and checkpoints for all filter types in
 	// parallel, by using a goroutine for each filter type.
@@ -504,6 +513,27 @@ func (b *blockManager) cfHandler() {
 		}(fType, storeLookup)
 	}
 	wg.Wait()
+
+	// Update the local filter header tip variable.
+	b.newFilterHeadersMtx.RLock()
+	filterHeaderTip = b.filterHeaderTip
+	filterHeaderTipHash = b.filterHeaderTipHash
+	b.newFilterHeadersMtx.RUnlock()
+
+	// Now we check the headers again. If the block headers are not yet
+	// current, then we go back to the loop waiting for them to finish.
+	if !b.IsCurrent() {
+		goto waitForHeaders
+	}
+
+	// We also go back to the loop if the filter header tip is still
+	// lagging behind the block header tip.
+	b.newHeadersMtx.RLock()
+	if filterHeaderTip+wire.CFCheckptInterval <= b.headerTip {
+		b.newHeadersMtx.RUnlock()
+		goto waitForHeaders
+	}
+	b.newHeadersMtx.RUnlock()
 
 	log.Infof("Fully caught up with cfheaders at height "+
 		"%v, waiting at tip for new blocks", lastHeight)
