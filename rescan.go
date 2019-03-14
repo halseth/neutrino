@@ -66,6 +66,9 @@ type ChainSource interface {
 	GetCFilterSmart(chainhash.Hash, wire.FilterType,
 		...QueryOption) (*gcs.Filter, error)
 
+	GetCFilterBatch(uint32, wire.FilterType,
+		...QueryOption) ([]*FilterResponse, error)
+
 	// Subscribe returns a block subscription that delivers block
 	// notifications in order. The bestHeight parameter can be used to
 	// signal that a backlog of notifications should be delivered from this
@@ -972,6 +975,48 @@ func blockFilterMatches(chain ChainSource, ro *rescanOptions,
 	}
 
 	return false, nil
+}
+
+// blockFilterMatchesAny returns the blocks from startHeight that matches the
+// watched items. The second returned value is the height of the block the
+// query stopped at.
+func blockFilterMatchesAny(chain ChainSource, ro *rescanOptions,
+	startHeight uint32) ([]*chainhash.Hash, uint32, error) {
+
+	// Get a batch of filters starting from the start height.
+	filters, err := chain.GetCFilterBatch(startHeight, wire.GCSFilterRegular)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if len(filters) == 0 {
+		return nil, 0, fmt.Errorf("no filters found")
+	}
+
+	// If we found filters, then we'll check each one against the watch
+	// list.
+	var matches []*chainhash.Hash
+	for _, filter := range filters {
+		match, err := matchBlockFilter(
+			ro, filter.Filter, &filter.BlockHash,
+		)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !match {
+			continue
+		}
+
+		// If we had a match, return this block hash as part of the
+		// mathing blocks.
+		matches = append(matches, &filter.BlockHash)
+	}
+
+	// The last filter in the filter batch we fetched will be the stop
+	// height.
+	stopHeight := filters[len(filters)-1].Height
+
+	return matches, stopHeight, nil
 }
 
 // updateFilter atomically updates the filter and rewinds to the specified
