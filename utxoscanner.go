@@ -294,13 +294,23 @@ func (s *UtxoScanner) scanFromHeight(initHeight uint32) error {
 		// blocks.
 		startHeight = initHeight
 		endHeight   = uint32(bestStamp.Height)
+
+		// matchHeight is the last height we stopped at checking filter
+		// matches.
+		matchHeight = int64(startHeight) - 1
+
+		// matches is the current set of blocks with a filter match.
+		matches []*chainhash.Hash
 	)
 
 	reporter := newBatchSpendReporter()
 
 scanToEnd:
-	// Scan forward through the blockchain and look for any transactions that
-	// might spend the given UTXOs.
+	log.Debugf("Starting batch scan from height %v to %v",
+		startHeight, endHeight)
+
+	// Scan forward through the blockchain and look for any transactions
+	// that might spend the given UTXOs.
 	for height := startHeight; height <= endHeight; height++ {
 		// Before beginning to scan this height, check to see if the
 		// utxoscanner has been signaled to exit.
@@ -315,29 +325,47 @@ scanToEnd:
 			return reporter.FailRemaining(err)
 		}
 
-		// If there are any new requests that can safely be added to this batch,
-		// then try and fetch them.
-		newReqs := s.dequeueAtHeight(height)
-
-		// If an outpoint is created in this block, then fetch it regardless.
-		// Otherwise check to see if the filter matches any of our watched
-		// outpoints.
-		fetch := len(newReqs) > 0
-		if !fetch {
+		// If the current height is above the last height we checked
+		// for matches, we must query for a new set of filters.
+		if int64(height) > matchHeight {
 			options := rescanOptions{
 				watchList: reporter.filterEntries,
 			}
-
-			match, err := s.cfg.BlockFilterMatches(&options, hash)
+			var stopHeight uint32
+			matches, stopHeight, err = s.cfg.BlockFilterMatchesAny(
+				&options, uint32(height),
+			)
 			if err != nil {
 				return reporter.FailRemaining(err)
 			}
+			matchHeight = int64(stopHeight)
 
-			// If still no match is found, we have no reason to
-			// fetch this block, and can continue to next height.
-			if !match {
-				continue
-			}
+			log.Debugf("Batch filter match for %d entries in "+
+				"range [%d, %d] found %d matches.",
+				len(reporter.filterEntries), height,
+				stopHeight, len(matches))
+		}
+
+		// If there are any new requests that can safely be added to
+		// this batch, then try and fetch them.
+		newReqs := s.dequeueAtHeight(height)
+
+		// If an outpoint is created in this block, then fetch it
+		// regardless.
+		fetch := len(newReqs) > 0
+
+		// Otherwise check to see if the filter matches any of our
+		// watched outpoints.
+		if len(matches) > 0 && hash == matches[0] {
+			log.Debugf("Got filter match at height %d", height)
+			fetch = true
+			matches = matches[1:]
+		}
+
+		// We go on to the next height if neither an outpoint was
+		// created nor we had any filter matches.
+		if !fetch {
+			continue
 		}
 
 		// At this point, we've determined that we either (1) have new
