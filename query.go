@@ -1318,6 +1318,24 @@ func (s *ChainService) GetCFilterBatch(startHeight uint32,
 		return nil, fmt.Errorf("could not get filters")
 	}
 
+	qo := defaultQueryOptions()
+	qo.applyQueryOptions(options...)
+	if qo.persistToDisk {
+		dbFilterType := filterdb.RegularFilter
+
+		for _, f := range filterResp {
+			err := s.FilterDB.PutFilter(
+				&f.BlockHash, f.Filter, dbFilterType,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			log.Tracef("Wrote filter for block %s, type %d",
+				f.BlockHash, filterType)
+		}
+	}
+
 	// TODO(halseth): cache filters?
 
 	log.Debugf("Returning %d filter responses", len(filterResp))
