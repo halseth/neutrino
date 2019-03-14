@@ -89,6 +89,12 @@ type UtxoScannerConfig struct {
 	// against the rescan options.
 	BlockFilterMatches func(ro *rescanOptions, blockHash *chainhash.Hash) (bool, error)
 
+	// BlockFilterMatches checks a batch of cfilters from startHeight for
+	// matches against the rescan options. The blocks with a match and the
+	// last block height checked is returned.
+	BlockFilterMatchesAny func(ro *rescanOptions, startHeight uint32) (
+		[]*chainhash.Hash, uint32, error)
+
 	// GetBlock fetches a block from the p2p network.
 	GetBlock func(chainhash.Hash, ...QueryOption) (*btcutil.Block, error)
 }

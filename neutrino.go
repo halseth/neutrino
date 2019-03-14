@@ -788,6 +788,13 @@ func NewChainService(cfg Config) (*ChainService, error) {
 				&RescanChainSource{&s}, ro, blockHash,
 			)
 		},
+		BlockFilterMatchesAny: func(ro *rescanOptions,
+			startHeight uint32) ([]*chainhash.Hash, uint32, error) {
+
+			return blockFilterMatchesAny(
+				&RescanChainSource{&s}, ro, startHeight,
+			)
+		},
 	})
 
 	s.broadcaster = pushtx.NewBroadcaster(&pushtx.Config{
