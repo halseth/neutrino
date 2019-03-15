@@ -25,6 +25,7 @@ type batchSpendReporter struct {
 	// outpoints caches the filter entry for each outpoint, conserving
 	// allocations when reconstructing the current filterEntries.
 	outpoints map[wire.OutPoint][]byte
+	// TODO: keep interval for each outpoint instead of request.
 
 	// filterEntries holds the current set of watched outpoint, and is
 	// applied to cfilters to guage whether we should download the block.
@@ -46,19 +47,42 @@ func newBatchSpendReporter() *batchSpendReporter {
 // were detected. If we were able to find the initial output, this will be
 // delivered signaling that no spend was detected. If the original output could
 // not be found, a nil spend report is returned.
-func (b *batchSpendReporter) NotifyUnspentAndUnfound() {
+func (b *batchSpendReporter) NotifyUnspentAndUnfound() uint32 {
 	log.Debugf("Finished batch, %d unspent outpoints", len(b.requests))
+
+	var rem []*GetUtxoRequest
+	var earliest uint32
 
 	for outpoint, requests := range b.requests {
 		// A nil SpendReport indicates the output was not found.
+		remainder := false
 		tx, ok := b.initialTxns[outpoint]
 		if !ok {
 			log.Warnf("Unknown initial txn for getuxo request %v",
 				outpoint)
+
 		}
 
+		for _, r := range requests {
+			if len(r.intervals) > 1 || r.intervals[0].start > r.BirthHeight {
+
+				log.Debugf("Fonud intervals %d with remainder: birth=%v, scanstart=%v", len(r.intervals), r.BirthHeight, r.intervals[0].start)
+				rem = append(rem, r)
+				remainder = true
+				if earliest == 0 || r.BirthHeight < earliest {
+					earliest = r.BirthHeight
+				}
+			}
+		}
+
+		if remainder {
+			continue
+		}
+
+		log.Infof("notifying op %v", outpoint)
 		b.notifyRequests(&outpoint, requests, tx, nil)
 	}
+	return earliest
 }
 
 // FailRemaining will return an error to all remaining requests in the event we
@@ -98,13 +122,13 @@ func (b *batchSpendReporter) notifyRequests(
 // immediately dispatched, and the watchlist updated in preparation of filtering
 // the next block.
 func (b *batchSpendReporter) ProcessBlock(blk *wire.MsgBlock,
-	newReqs []*GetUtxoRequest, height uint32) {
+	birthReqs []*GetUtxoRequest, height uint32) {
 
 	// If any requests want the UTXOs at this height, scan the block to find
 	// the original outputs that might be spent from.
-	if len(newReqs) > 0 {
-		b.addNewRequests(newReqs)
-		b.findInitialTransactions(blk, newReqs, height)
+	if len(birthReqs) > 0 {
+		//		b.addNewRequests(newReqs)
+		b.findInitialTransactions(blk, birthReqs, height)
 	}
 
 	// Next, filter the block for any spends using the current set of
@@ -114,7 +138,7 @@ func (b *batchSpendReporter) ProcessBlock(blk *wire.MsgBlock,
 	// Finally, rebuild filter entries from cached entries remaining in
 	// outpoints map. This will provide an updated watchlist used to scan
 	// the subsequent filters.
-	rebuildWatchlist := len(newReqs) > 0 || len(spends) > 0
+	rebuildWatchlist := len(birthReqs) > 0 || len(spends) > 0
 	if rebuildWatchlist {
 		b.filterEntries = b.filterEntries[:0]
 		for _, entry := range b.outpoints {
@@ -126,12 +150,12 @@ func (b *batchSpendReporter) ProcessBlock(blk *wire.MsgBlock,
 // addNewRequests adds a set of new GetUtxoRequests to the spend reporter's
 // state. This method immediately adds the request's outpoints to the reporter's
 // watchlist.
-func (b *batchSpendReporter) addNewRequests(reqs []*GetUtxoRequest) {
+func (b *batchSpendReporter) addNewRequests(reqs []*GetUtxoRequest, height uint32) {
 	for _, req := range reqs {
 		outpoint := req.Input.OutPoint
 
-		log.Debugf("Adding outpoint=%s height=%d to watchlist",
-			outpoint, req.BirthHeight)
+		log.Debugf("Adding outpoint=%s height=%d to watchlist, at scan height=%v",
+			outpoint, req.BirthHeight, height)
 
 		b.requests[outpoint] = append(b.requests[outpoint], req)
 
@@ -143,6 +167,89 @@ func (b *batchSpendReporter) addNewRequests(reqs []*GetUtxoRequest) {
 			b.filterEntries = append(b.filterEntries, entry)
 		}
 	}
+}
+
+func (b *batchSpendReporter) setScanned(height uint32) {
+	//	log.Infof("setting scanned at height %d", height)
+	i := 0
+	for outpoint, reqs := range b.requests {
+		for _, r := range reqs {
+
+			if len(r.intervals) == 0 {
+				in := &interval{}
+				r.intervals = []*interval{in}
+				log.Infof("created new interval for req %v", r)
+			}
+
+			for _, in := range r.intervals {
+				in.extend(height)
+			}
+
+			if len(r.intervals) > 1 {
+				log.Infof("attempting to combine intervals %v and %v", *r.intervals[0], *r.intervals[1])
+				combination := combine(r.intervals[0], r.intervals[1])
+				if combination != nil {
+					log.Infof("combined intervals!!! %v and %v", *combination)
+					r.intervals = []*interval{combination}
+
+					tx, ok := b.initialTxns[outpoint]
+					if !ok {
+						log.Warnf("Unknown initial txn for getuxo request %v",
+							outpoint)
+
+					}
+
+					log.Infof("notifying op %v", outpoint)
+					b.notifyRequests(&outpoint, reqs, tx, nil)
+
+				}
+			}
+			i++
+		}
+	}
+
+	//	log.Infof("setting %d reqs scanned at height %d", i, height)
+}
+
+type interval struct {
+	start uint32
+	end   uint32
+}
+
+func (i *interval) extend(height uint32) {
+	if i.start == 0 && i.end == 0 {
+		i.start = height
+		i.end = height + 1
+		return
+	}
+
+	if height != i.end+1 {
+		return
+	}
+	i.end++
+}
+
+func combine(i, j *interval) *interval {
+
+	if i.end < j.start {
+		return nil
+	}
+
+	if i.start > j.end {
+		return nil
+	}
+
+	var ij interval = *i
+	if j.start < ij.start {
+		ij.start = j.start
+	}
+
+	if j.end > ij.end {
+		ij.end = j.end
+	}
+
+	return &ij
+
 }
 
 // findInitialTransactions searches the given block for the creation of the
@@ -220,6 +327,7 @@ func (b *batchSpendReporter) findInitialTransactions(block *wire.MsgBlock,
 		}
 
 		b.initialTxns[req.Input.OutPoint] = tx
+
 	}
 
 	return initialTxns

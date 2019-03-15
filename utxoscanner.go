@@ -39,6 +39,8 @@ type GetUtxoRequest struct {
 	// what gets cached in result.
 	mu sync.Mutex
 
+	intervals []*interval
+
 	quit chan struct{}
 }
 
@@ -255,15 +257,17 @@ func (s *UtxoScanner) batchManager() {
 
 // dequeueAtHeight returns all GetUtxoRequests that have starting height of the
 // given height.
-func (s *UtxoScanner) dequeueAtHeight(height uint32) []*GetUtxoRequest {
+func (s *UtxoScanner) dequeueAtHeight(height uint32) ([]*GetUtxoRequest, []*GetUtxoRequest) {
 	s.cv.L.Lock()
 	defer s.cv.L.Unlock()
 
 	// Take any requests that are too old to go in this batch and keep them for
 	// the next batch.
+
+	var all []*GetUtxoRequest
 	for !s.pq.IsEmpty() && s.pq.Peek().BirthHeight < height {
 		item := heap.Pop(&s.pq).(*GetUtxoRequest)
-		s.nextBatch = append(s.nextBatch, item)
+		all = append(all, item)
 	}
 
 	var requests []*GetUtxoRequest
@@ -271,8 +275,9 @@ func (s *UtxoScanner) dequeueAtHeight(height uint32) []*GetUtxoRequest {
 		item := heap.Pop(&s.pq).(*GetUtxoRequest)
 		requests = append(requests, item)
 	}
+	all = append(requests, all...)
 
-	return requests
+	return requests, all
 }
 
 // scanFromHeight runs a single batch, pulling in any requests that get added
@@ -325,6 +330,11 @@ scanToEnd:
 			return reporter.FailRemaining(err)
 		}
 
+		// If there are any new requests that can safely be added to
+		// this batch, then try and fetch them.
+		newReqs, all := s.dequeueAtHeight(height)
+		reporter.addNewRequests(all, height)
+
 		// If the current height is above the last height we checked
 		// for matches, we must query for a new set of filters.
 		if int64(height) > matchHeight {
@@ -345,11 +355,6 @@ scanToEnd:
 				len(reporter.filterEntries), height,
 				stopHeight, len(matches))
 		}
-
-		// If there are any new requests that can safely be added to
-		// this batch, then try and fetch them.
-		newReqs := s.dequeueAtHeight(height)
-
 		// If an outpoint is created in this block, then fetch it
 		// regardless.
 		fetch := len(newReqs) > 0
@@ -365,6 +370,7 @@ scanToEnd:
 		// We go on to the next height if neither an outpoint was
 		// created nor we had any filter matches.
 		if !fetch {
+			reporter.setScanned(height)
 			continue
 		}
 
@@ -397,6 +403,8 @@ scanToEnd:
 		log.Debugf("Processing block height=%d hash=%s", height, hash)
 
 		reporter.ProcessBlock(block.MsgBlock(), newReqs, height)
+
+		reporter.setScanned(height)
 	}
 
 	// We've scanned up to the end height, now perform a check to see if we
@@ -413,10 +421,18 @@ scanToEnd:
 	if uint32(currStamp.Height) > endHeight {
 		startHeight = endHeight + 1
 		endHeight = uint32(currStamp.Height)
+		log.Debugf("Scanning to end for new best height %d", endHeight)
 		goto scanToEnd
 	}
 
-	reporter.NotifyUnspentAndUnfound()
+	earliest := reporter.NotifyUnspentAndUnfound()
+
+	if earliest != 0 {
+		startHeight = earliest
+		endHeight = uint32(currStamp.Height)
+		log.Debugf("Scanning from %d to end %d new earliest", startHeight, endHeight)
+		goto scanToEnd
+	}
 
 	return nil
 }
