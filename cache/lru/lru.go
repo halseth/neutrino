@@ -85,6 +85,7 @@ func (c *Cache) evict(needed uint64) error {
 			// Remove the element from the cache.
 			c.ll.Remove(elr)
 			delete(c.cache, ce.key)
+			fmt.Println("evicted element from cache")
 		}
 	}
 

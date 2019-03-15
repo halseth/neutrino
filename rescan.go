@@ -63,6 +63,9 @@ type ChainSource interface {
 	GetCFilter(chainhash.Hash, wire.FilterType,
 		...QueryOption) (*gcs.Filter, error)
 
+	GetCFilterSmart(chainhash.Hash, wire.FilterType,
+		...QueryOption) (*gcs.Filter, error)
+
 	// Subscribe returns a block subscription that delivers block
 	// notifications in order. The bestHeight parameter can be used to
 	// signal that a backlog of notifications should be delivered from this
@@ -953,7 +956,7 @@ func blockFilterMatches(chain ChainSource, ro *rescanOptions,
 	blockHash *chainhash.Hash) (bool, error) {
 
 	// TODO(roasbeef): need to ENSURE always get filter
-	filter, err := chain.GetCFilter(*blockHash, wire.GCSFilterRegular)
+	filter, err := chain.GetCFilterSmart(*blockHash, wire.GCSFilterRegular)
 	if err != nil {
 		if err == headerfs.ErrHashNotFound {
 			// Block has been reorged out from under us.
