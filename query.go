@@ -343,6 +343,7 @@ func queryChainServiceBatch(
 				// The query is now marked as in-process. We
 				// begin to process it.
 				handleQuery = i
+				log.Infof("querying batch index %d", i)
 				sp.QueueMessageWithEncoding(queryMsgs[i],
 					nil, qo.encoding)
 				break
@@ -778,9 +779,9 @@ type cfiltersQuery struct {
 }
 
 // queryMsg returns the wire message to perform this query.
-func (q *cfiltersQuery) queryMsg() wire.Message {
+func (q *cfiltersQuery) queryMsg() *wire.MsgGetCFilters {
 	return wire.NewMsgGetCFilters(
-		q.filterType, uint32(q.startHeight), q.stopHash,
+		wire.GCSFilterRegular, uint32(q.startHeight), q.stopHash,
 	)
 }
 
@@ -916,25 +917,27 @@ func (s *ChainService) prepareCFiltersQuery(blockHash chainhash.Hash,
 
 // handleCFiltersRespons is called every time we receive a response for the
 // GetCFilters request.
-func (s *ChainService) handleCFiltersResponse(q *cfiltersQuery,
-	resp wire.Message, quit chan<- struct{}) {
+func validateFilterResponse(headerIndex map[chainhash.Hash]int,
+	filterHeaders []chainhash.Hash, blockHeaders []wire.BlockHeader,
+	resp wire.Message) (int, *gcs.Filter, bool) {
 
 	// We're only interested in "cfilter" messages.
 	response, ok := resp.(*wire.MsgCFilter)
 	if !ok {
-		return
+		return 0, nil, false
 	}
 
 	// If the response doesn't match our request, ignore this message.
-	if q.filterType != response.FilterType {
-		return
+	if response.FilterType != wire.GCSFilterRegular {
+		return 0, nil, false
 	}
 
 	// If this filter is for a block not in our index, we can ignore it, as
 	// we either already got it, or it is out of our queried range.
-	i, ok := q.headerIndex[response.BlockHash]
+	i, ok := headerIndex[response.BlockHash]
 	if !ok {
-		return
+		log.Warnf("response not in header index")
+		return 0, nil, false
 	}
 
 	gotFilter, err := gcs.FromNBytes(
@@ -942,76 +945,28 @@ func (s *ChainService) handleCFiltersResponse(q *cfiltersQuery,
 	)
 	if err != nil {
 		// Malformed filter data. We can ignore this message.
-		return
+		log.Warnf("malformed filter")
+		return 0, nil, false
 	}
 
 	// Now that we have a proper filter, ensure that re-calculating the
 	// filter header hash for the header _after_ the filter in the chain
 	// checks out. If not, we can ignore this response.
-	curHeader := q.filterHeaders[i]
-	prevHeader := q.filterHeaders[i-1]
+	curHeader := filterHeaders[i]
+	prevHeader := filterHeaders[i-1]
 	gotHeader, err := builder.MakeHeaderForFilter(
 		gotFilter, prevHeader,
 	)
 	if err != nil {
-		return
+		log.Warnf("unable to build filter: %v", err)
+		return 0, nil, false
 	}
 
 	if gotHeader != curHeader {
-		return
+		log.Warnf("header mismatch")
+		return 0, nil, false
 	}
-
-	// At this point, the filter matches what we know about it and we
-	// declare it sane. If this is the filter requested initially, send it
-	// to the caller immediately.
-	if response.BlockHash == q.targetHash {
-		q.filterChan <- gotFilter
-	}
-
-	// Put the filter in the cache and persistToDisk if the caller
-	// requested it.
-	// TODO(halseth): for an LRU we could take care to insert the next
-	// height filter last.
-	dbFilterType := filterdb.RegularFilter
-	evict, err := s.putFilterToCache(
-		&response.BlockHash, dbFilterType, gotFilter,
-	)
-	if err != nil {
-		log.Warnf("Couldn't write filter to cache: %v", err)
-	}
-
-	// TODO(halseth): dynamically increase/decrease the batch size to match
-	// our cache capacity.
-	numFilters := q.stopHeight - q.startHeight + 1
-	if evict && s.FilterCache.Len() < int(numFilters) {
-		log.Debugf("Items evicted from the cache with less "+
-			"than %d elements. Consider increasing the "+
-			"cache size...", numFilters)
-	}
-
-	qo := defaultQueryOptions()
-	qo.applyQueryOptions(q.options...)
-	if qo.persistToDisk {
-		err = s.FilterDB.PutFilter(
-			&response.BlockHash, gotFilter, dbFilterType,
-		)
-		if err != nil {
-			log.Warnf("Couldn't write filter to filterDB: "+
-				"%v", err)
-		}
-
-		log.Tracef("Wrote filter for block %s, type %d",
-			&response.BlockHash, dbFilterType)
-	}
-
-	// Finally, we can delete it from the headerIndex.
-	delete(q.headerIndex, response.BlockHash)
-
-	// If the headerIndex is empty, we got everything we wanted, and can
-	// exit.
-	if len(q.headerIndex) == 0 {
-		close(quit)
-	}
+	return i, gotFilter, true
 }
 
 // GetCFilter gets a cfilter from the database. Failing that, it requests the
@@ -1091,7 +1046,7 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 			// Check responses and if we get one that matches, end
 			// the query early.
 			func(_ *ServerPeer, resp wire.Message, quit chan<- struct{}) {
-				s.handleCFiltersResponse(query, resp, quit)
+				//s.handleCFiltersResponse(query, filterHeaders, blockHeaders, resp, quit)
 			},
 			query.options...,
 		)
@@ -1122,6 +1077,230 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 		return nil, nil
 	}
 
+}
+
+// FilterResponse contains information about a filter gotten from a filter
+// query.
+type FilterResponse struct {
+	// BlockHash is the block hash fot eh block this filter describes.
+	BlockHash chainhash.Hash
+
+	// Height is the height of the block.
+	Height uint32
+
+	// Filter is the received filter.
+	Filter *gcs.Filter
+}
+
+// GetCFilterBatch requests abatch of filters from the network, starting at the
+// given height.
+func (s *ChainService) GetCFilterBatch(from, to uint32) (
+	<-chan *FilterResponse, chan<- struct{}, error) {
+
+	// We need a longer timeout, since we are going to receive more
+	// than a single response.
+	var options []QueryOption
+	options = append(options, Timeout(QueryBatchTimeout))
+
+	startHeight := int64(from)
+	stopHeight := int64(to)
+	if startHeight > stopHeight {
+		startHeight = int64(to)
+		stopHeight = int64(from)
+	}
+
+	bestBlock, err := s.BestBlock()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to get best block: %v", err)
+	}
+	bestHeight := int64(bestBlock.Height)
+
+	if stopHeight > bestHeight {
+		stopHeight = bestHeight
+	}
+
+	stopHash, err := s.GetBlockHash(stopHeight)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to get hash for "+
+			"stopHeight=%d: %v", stopHeight, err)
+	}
+
+	// In order to verify the authenticity of the received filters, we'll
+	// fetch the block headers and filter headers in the range
+	// [startHeight-1, stopHeight]. We go one below our startHeight since
+	// the hash of the previous block is needed for validation.
+	numFilters := uint32(stopHeight - startHeight + 1)
+	blockHeaders, _, err := s.BlockHeaders.FetchHeaderAncestors(
+		numFilters, stopHash,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to get %d blockheader "+
+			"ancestors for stopHash=%v: %v", numFilters,
+			stopHash, err)
+	}
+
+	if len(blockHeaders) != int(numFilters)+1 {
+		return nil, nil, fmt.Errorf("expected %d block headers, got %d",
+			numFilters+1, len(blockHeaders))
+	}
+
+	filterHeaders, _, err := s.RegFilterHeaders.FetchHeaderAncestors(
+		numFilters, stopHash,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to get %d filter header "+
+			"ancestors for stopHash=%v: %v", numFilters, stopHash,
+			err)
+	}
+
+	if len(filterHeaders) != int(numFilters)+1 {
+		return nil, nil, fmt.Errorf("expected %d filter headers, got %d",
+			numFilters+1, len(filterHeaders))
+	}
+
+	// We create a header index such that we can easily index into our
+	// header slices for a given block hash in the received response,
+	// without consulting the database. This also keeps track of for which
+	// blocks we are still awaiting a response. We start at index=1, as 0
+	// is for the block startHeight-1, which is only needed for validation.
+	headerIndex := make(map[chainhash.Hash]int)
+	for i := 1; i < len(blockHeaders); i++ {
+		block := blockHeaders[i]
+		headerIndex[block.BlockHash()] = i
+	}
+
+	remHeights := make(map[int]int)
+	remBatches := make(map[int]int)
+	var batch []wire.Message
+	for i, j := 1, 2; i < len(filterHeaders); i = j {
+		j = i + wire.MaxGetCFiltersReqRange
+		if j > len(filterHeaders) {
+			j = len(filterHeaders)
+		}
+
+		stopHash := blockHeaders[j-1].BlockHash()
+		msg := wire.NewMsgGetCFilters(
+			wire.GCSFilterRegular,
+			uint32(startHeight)+uint32(i)-1,
+			&stopHash,
+		)
+
+		inBatch := 0
+		for k := i; k < j; k++ {
+			remHeights[k] = len(batch)
+			inBatch++
+		}
+		remBatches[len(batch)] = inBatch
+
+		batch = append(batch, msg)
+	}
+
+	// Start executing queries, in the order we want the results.
+
+	// TODO: revers
+
+	cancel := make(chan struct{})
+	filtersNoOrder := make(chan *FilterResponse, numFilters)
+	filtersOrder := make(chan *FilterResponse, numFilters)
+
+	go func() {
+		receivedFilters := make(map[uint32]*FilterResponse)
+		nextHeight := uint32(from)
+
+		for nextHeight != uint32(to) {
+			select {
+			case filter := <-filtersNoOrder:
+				receivedFilters[filter.Height] = filter
+				log.Warnf("Received filter at height %v", filter.Height)
+			case <-cancel:
+				return
+			}
+
+		sendLoop:
+			for {
+				filter, ok := receivedFilters[nextHeight]
+				if !ok {
+					log.Warnf("don't have filter at height %d yet", nextHeight)
+					break sendLoop
+				}
+
+				select {
+				case filtersOrder <- filter:
+				case <-cancel:
+					return
+				}
+				log.Warnf("sent ordered filter at height %d yet", nextHeight)
+
+				delete(receivedFilters, nextHeight)
+				nextHeight++
+			}
+		}
+
+		log.Warnf("order scheduler exiting")
+	}()
+
+	go queryChainServiceBatch(
+		s,
+		batch,
+		func(_ *ServerPeer, query wire.Message,
+			resp wire.Message) bool {
+
+			i, filter, ok := validateFilterResponse(
+				headerIndex, filterHeaders, blockHeaders, resp,
+			)
+			if !ok {
+				log.Warnf("Got invalid filter response ")
+				return false
+			}
+			height := uint32(startHeight) + uint32(i) - 1
+			log.Warnf("Got valid filter response at height %v", height)
+
+			batchNum, ok := remHeights[i]
+			if !ok {
+				log.Warnf("Got duplucate filter response at height %v", height)
+				return false
+			}
+
+			delete(remHeights, i)
+
+			rem := remBatches[batchNum]
+			if rem <= 0 {
+				panic("unexpeced rem in batch")
+			}
+			log.Warnf("rem %d in batchnum %d", rem, batchNum)
+
+			f := &FilterResponse{
+				BlockHash: blockHeaders[i].BlockHash(),
+				Height:    height,
+				Filter:    filter,
+			}
+
+			select {
+			case filtersNoOrder <- f:
+			case <-cancel:
+				return false
+			}
+
+			rem--
+			remBatches[batchNum] = rem
+
+			if rem > 0 {
+				log.Errorf("still %d left in batch %d", rem, batchNum)
+				return false
+			}
+
+			// TODO: potentially have to wait for all msgs to have
+			// arrived before we can return true.
+			log.Errorf("returning true")
+			delete(remBatches, batchNum)
+			return true
+
+		},
+		cancel,
+		Timeout(QueryBatchTimeout),
+	)
+
+	return filtersOrder, cancel, nil
 }
 
 // GetBlock gets a block by requesting it from the network, one peer at a

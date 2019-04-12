@@ -8,6 +8,7 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcutil/gcs"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 )
 
@@ -88,9 +89,12 @@ type UtxoScannerConfig struct {
 	// BlockFilterMatches checks the cfilter for the block hash for matches
 	// against the rescan options.
 	BlockFilterMatches func(ro *rescanOptions, blockHash *chainhash.Hash) (bool, error)
+	FilterMatches      func(ro *rescanOptions, filter *gcs.Filter, blockHash *chainhash.Hash) (bool, error)
 
 	// GetBlock fetches a block from the p2p network.
 	GetBlock func(chainhash.Hash, ...QueryOption) (*btcutil.Block, error)
+
+	Chain *ChainService
 }
 
 // UtxoScanner batches calls to GetUtxo so that a single scan can search for
@@ -291,13 +295,28 @@ func (s *UtxoScanner) scanFromHeight(initHeight uint32) error {
 	)
 
 	reporter := newBatchSpendReporter()
-
 scanToEnd:
+
+	log.Debugf("utxo scanning height %d to %d", startHeight, endHeight)
+	filters, cancel, err := s.cfg.Chain.GetCFilterBatch(initHeight, endHeight)
+	if err != nil {
+		return err
+	}
+
+	log.Debugf("utxo got filter channel")
+	defer func() {
+		if cancel != nil {
+			close(cancel)
+			cancel = nil
+		}
+	}()
+
 	// Scan forward through the blockchain and look for any transactions that
 	// might spend the given UTXOs.
 	for height := startHeight; height <= endHeight; height++ {
 		// Before beginning to scan this height, check to see if the
 		// utxoscanner has been signaled to exit.
+		log.Debugf("utxo scanning %d", height)
 		select {
 		case <-s.quit:
 			return reporter.FailRemaining(ErrShuttingDown)
@@ -307,6 +326,15 @@ scanToEnd:
 		hash, err := s.cfg.GetBlockHash(int64(height))
 		if err != nil {
 			return reporter.FailRemaining(err)
+		}
+
+		log.Debugf("utxo get filter at %d", height)
+		var filter *FilterResponse
+		select {
+		case filter = <-filters:
+			log.Debugf("utxo got filter at %d", height)
+		case <-s.quit:
+			return reporter.FailRemaining(ErrShuttingDown)
 		}
 
 		// If there are any new requests that can safely be added to this batch,
@@ -322,7 +350,8 @@ scanToEnd:
 				watchList: reporter.filterEntries,
 			}
 
-			match, err := s.cfg.BlockFilterMatches(&options, hash)
+			log.Infof("utxoscanner attempting to match filter at height %d", filter.Height)
+			match, err := s.cfg.FilterMatches(&options, filter.Filter, hash)
 			if err != nil {
 				return reporter.FailRemaining(err)
 			}
@@ -377,8 +406,13 @@ scanToEnd:
 	// If the returned height is higher, we still have more blocks to go.
 	// Shift the start and end heights and continue scanning.
 	if uint32(currStamp.Height) > endHeight {
+		log.Debugf("utxo going back to scan loop!")
 		startHeight = endHeight + 1
 		endHeight = uint32(currStamp.Height)
+		if cancel != nil {
+			close(cancel)
+			cancel = nil
+		}
 		goto scanToEnd
 	}
 

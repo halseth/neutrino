@@ -20,6 +20,7 @@ import (
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcutil/gcs"
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/lightninglabs/neutrino/blockntfns"
@@ -782,6 +783,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	}
 
 	s.utxoScanner = NewUtxoScanner(&UtxoScannerConfig{
+		Chain:        &s,
 		BestSnapshot: s.BestBlock,
 		GetBlockHash: s.GetBlockHash,
 		GetBlock:     s.GetBlock,
@@ -791,6 +793,11 @@ func NewChainService(cfg Config) (*ChainService, error) {
 			return blockFilterMatches(
 				&RescanChainSource{&s}, ro, blockHash,
 			)
+		},
+		FilterMatches: func(ro *rescanOptions, filter *gcs.Filter,
+			blockHash *chainhash.Hash) (bool, error) {
+
+			return matchBlockFilter(ro, filter, blockHash)
 		},
 	})
 
