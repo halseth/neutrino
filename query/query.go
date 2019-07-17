@@ -148,6 +148,7 @@ func QueryBatch(
 		}
 	}()
 
+	// TODO: use
 	return errChan
 }
 
@@ -182,6 +183,8 @@ func (w *worker) start() {
 			return
 		}
 		log.Infof("johan peer got job %d", job.i)
+
+		// Check restrictions, fail if not valid.
 
 		// send job to peer
 		// TODO: need encoding?
