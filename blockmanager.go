@@ -26,6 +26,7 @@ import (
 	"github.com/lightninglabs/neutrino/chainsync"
 	"github.com/lightninglabs/neutrino/headerfs"
 	"github.com/lightninglabs/neutrino/headerlist"
+	"github.com/lightninglabs/neutrino/query"
 )
 
 const (
@@ -108,6 +109,9 @@ type blockManagerCfg struct {
 	BlockHeaders     headerfs.BlockHeaderStore
 	RegFilterHeaders *headerfs.FilterHeaderStore
 	TimeSource       blockchain.MedianTimeSource
+
+	// QueryAccess is used to make queries to connected Bitcoin peers.
+	QueryAccess query.QueryAccess
 
 	BanPeer        func(addr string, reason banman.Reason) error
 	DisconnectPeer func(addr string) error
@@ -853,7 +857,8 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 	startingInterval := curHeight / wire.CFCheckptInterval
 
 	log.Infof("Starting to query for cfheaders from "+
-		"checkpoint_interval=%v", startingInterval)
+		"checkpoint_interval=%v, checkpoints=%d", startingInterval,
+		len(checkpoints))
 
 	// We'll determine how many queries we'll make based on our starting
 	// interval and our set of checkpoints. Each query will attempt to fetch
@@ -934,38 +939,36 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 	// all at once. This message will distributed the header requests
 	// amongst all active peers, effectively sharding each query
 	// dynamically.
-	b.cfg.queryBatch(
-		queryMsgs,
+	headerChan := make(chan *wire.MsgCFHeaders, len(queryMsgs))
 
-		// Callback to process potential replies. Always called from
-		// the same goroutine as the outer function, so we don't have
-		// to worry about synchronization.
-		func(sp *ServerPeer, query wire.Message,
-			resp wire.Message) bool {
+	var msgs []*query.Query
+	for _, m := range queryMsgs {
+		handleResp := func(query, resp wire.Message,
+			peerAddr string) (bool, bool) {
 
 			r, ok := resp.(*wire.MsgCFHeaders)
 			if !ok {
 				// We are only looking for cfheaders messages.
-				return false
+				return false, false
 			}
 
 			q, ok := query.(*wire.MsgGetCFHeaders)
 			if !ok {
 				// We sent a getcfheaders message, so that's
 				// what we should be comparing against.
-				return false
+				return false, false
 			}
 
 			// The response doesn't match the query.
 			if q.FilterType != r.FilterType ||
 				q.StopHash != r.StopHash {
-				return false
+				return false, false
 			}
 
 			checkPointIndex, ok := stopHashes[r.StopHash]
 			if !ok {
 				// We never requested a matching stop hash.
-				return false
+				return false, false
 			}
 
 			// Use either the genesis header or the previous
@@ -995,7 +998,6 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 				// match what we know to be the best
 				// checkpoint, then we'll ban the peer so we
 				// can re-allocate the query elsewhere.
-				peerAddr := sp.Addr()
 				err := b.cfg.BanPeer(
 					peerAddr,
 					banman.InvalidFilterHeaderCheckpoint,
@@ -1007,7 +1009,7 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 
 				b.cfg.DisconnectPeer(peerAddr)
 
-				return false
+				return false, false
 			}
 
 			// At this point, the response matches the query, and
@@ -1019,109 +1021,145 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 			// they're too far ahead, or discard them if we don't
 			// need them.
 
-			// Find the first and last height for the blocks
-			// represented by this message.
-			startHeight := checkPointIndex*wire.CFCheckptInterval + 1
-			lastHeight := (nextCheckPointIndex + 1) * wire.CFCheckptInterval
-
-			log.Debugf("Got cfheaders from height=%v to "+
-				"height=%v, prev_hash=%v", startHeight,
-				lastHeight, r.PrevFilterHeader)
-
-			// If this is out of order but not yet written, we can
-			// verify that the checkpoints match, and then store
-			// them.
-			if startHeight > curHeight+1 {
-				log.Debugf("Got response for headers at "+
-					"height=%v, only at height=%v, stashing",
-					startHeight, curHeight)
-
-				queryResponses[checkPointIndex] = r
-
-				return true
+			select {
+			case headerChan <- r:
+			case <-b.quit:
+				return false, false
 			}
 
-			// If this is out of order stuff that's already been
-			// written, we can ignore it.
-			if lastHeight <= curHeight {
-				log.Debugf("Received out of order reply "+
-					"end_height=%v, already written", lastHeight)
-				return true
+			return true, true
+		}
+
+		msgs = append(msgs, &query.Query{
+			Req:        m,
+			HandleResp: handleResp,
+		})
+	}
+
+	// Hand the queries to the work manager, and consume the verified
+	// responses as they come back.
+	errChan := b.cfg.QueryAccess.Query(msgs)
+	for i := 0; i < len(queryMsgs); i++ {
+		var r *wire.MsgCFHeaders
+		select {
+		case r = <-headerChan:
+		case err := <-errChan:
+			log.Errorf("Query failed: %v", err)
+			return
+		case <-b.quit:
+			return
+		}
+
+		checkPointIndex, ok := stopHashes[r.StopHash]
+		if !ok {
+			// We never requested a matching stop hash.
+			log.Errorf("did not request stopHash %v", r.StopHash)
+			return
+		}
+
+		// Find the first and last height for the blocks
+		// represented by this message.
+		nextCheckPointIndex := checkPointIndex + maxCFCheckptsPerQuery - 1
+		if nextCheckPointIndex >= uint32(len(checkpoints)) {
+			nextCheckPointIndex = uint32(len(checkpoints)) - 1
+		}
+
+		startHeight := checkPointIndex*wire.CFCheckptInterval + 1
+		lastHeight := (nextCheckPointIndex + 1) * wire.CFCheckptInterval
+
+		log.Debugf("Got cfheaders from height=%v to "+
+			"height=%v, prev_hash=%v", startHeight,
+			lastHeight, r.PrevFilterHeader)
+
+		// If this is out of order but not yet written, we can
+		// verify that the checkpoints match, and then store
+		// them.
+		if startHeight > curHeight+1 {
+			log.Debugf("Got response for headers at "+
+				"height=%v, only at height=%v, stashing",
+				startHeight, curHeight)
+
+			queryResponses[checkPointIndex] = r
+			continue
+
+		}
+
+		// If this is out of order stuff that's already been
+		// written, we can ignore it.
+		if lastHeight <= curHeight {
+			log.Debugf("Received out of order reply "+
+				"end_height=%v, already written", lastHeight)
+			continue
+		}
+
+		// If this is the very first range we've requested, we
+		// may already have a portion of the headers written to
+		// disk.
+		//
+		// TODO(roasbeef): can eventually special case handle
+		// this at the top
+		if bytes.Equal(curHeader[:], initialFilterHeader[:]) {
+			// So we'll set the prev header to our best
+			// known header, and seek within the header
+			// range a bit so we don't write any duplicate
+			// headers.
+			r.PrevFilterHeader = *curHeader
+			offset := curHeight + 1 - startHeight
+			r.FilterHashes = r.FilterHashes[offset:]
+
+			log.Debugf("Using offset %d for initial "+
+				"filter header range (new prev_hash=%v)",
+				offset, r.PrevFilterHeader)
+		}
+
+		curHeader, err = b.writeCFHeadersMsg(r, store)
+		if err != nil {
+			panic(fmt.Sprintf("couldn't write cfheaders "+
+				"msg: %v", err))
+		}
+
+		// Then, we cycle through any cached messages, adding
+		// them to the batch and deleting them from the cache.
+		for {
+			// Determine the next checkpoint index we should
+			// process.
+			checkPointIndex += maxCFCheckptsPerQuery
+			if checkPointIndex == uint32(len(checkpoints)) {
+				checkPointIndex = uint32(len(checkpoints)) - 1
 			}
 
-			// If this is the very first range we've requested, we
-			// may already have a portion of the headers written to
-			// disk.
-			//
-			// TODO(roasbeef): can eventually special case handle
-			// this at the top
-			if bytes.Equal(curHeader[:], initialFilterHeader[:]) {
-				// So we'll set the prev header to our best
-				// known header, and seek within the header
-				// range a bit so we don't write any duplicate
-				// headers.
-				r.PrevFilterHeader = *curHeader
-				offset := curHeight + 1 - startHeight
-				r.FilterHashes = r.FilterHashes[offset:]
+			// We'll also update the current height of the
+			// last written set of cfheaders.
+			curHeight = checkPointIndex * wire.CFCheckptInterval
 
-				log.Debugf("Using offset %d for initial "+
-					"filter header range (new prev_hash=%v)",
-					offset, r.PrevFilterHeader)
+			// If we don't yet have the next response, then
+			// we'll break out so we can wait for the peers
+			// to respond with this message.
+			r, ok := queryResponses[checkPointIndex]
+			if !ok {
+				break
 			}
 
+			// We have another response to write, so delete
+			// it from the cache and write it.
+			delete(queryResponses, checkPointIndex)
+
+			log.Debugf("Writing cfheaders at height=%v to "+
+				"next checkpoint", curHeight)
+
+			// As we write the set of headers to disk, we
+			// also obtain the hash of the last filter
+			// header we've written to disk so we can
+			// properly set the PrevFilterHeader field of
+			// the next message.
 			curHeader, err = b.writeCFHeadersMsg(r, store)
 			if err != nil {
-				panic(fmt.Sprintf("couldn't write cfheaders "+
-					"msg: %v", err))
+				panic(fmt.Sprintf("couldn't write "+
+					"cfheaders msg: %v", err))
 			}
+		}
+	}
 
-			// Then, we cycle through any cached messages, adding
-			// them to the batch and deleting them from the cache.
-			for {
-				// Determine the next checkpoint index we should
-				// process.
-				checkPointIndex += maxCFCheckptsPerQuery
-				if checkPointIndex == uint32(len(checkpoints)) {
-					checkPointIndex = uint32(len(checkpoints)) - 1
-				}
-
-				// We'll also update the current height of the
-				// last written set of cfheaders.
-				curHeight = checkPointIndex * wire.CFCheckptInterval
-
-				// If we don't yet have the next response, then
-				// we'll break out so we can wait for the peers
-				// to respond with this message.
-				r, ok := queryResponses[checkPointIndex]
-				if !ok {
-					break
-				}
-
-				// We have another response to write, so delete
-				// it from the cache and write it.
-				delete(queryResponses, checkPointIndex)
-
-				log.Debugf("Writing cfheaders at height=%v to "+
-					"next checkpoint", curHeight)
-
-				// As we write the set of headers to disk, we
-				// also obtain the hash of the last filter
-				// header we've written to disk so we can
-				// properly set the PrevFilterHeader field of
-				// the next message.
-				curHeader, err = b.writeCFHeadersMsg(r, store)
-				if err != nil {
-					panic(fmt.Sprintf("couldn't write "+
-						"cfheaders msg: %v", err))
-				}
-			}
-
-			return true
-		},
-
-		// Same quit channel we're watching.
-		b.quit,
-	)
 }
 
 // writeCFHeadersMsg writes a cfheaders message to the specified store. It
