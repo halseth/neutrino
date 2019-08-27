@@ -669,6 +669,7 @@ type ChainService struct {
 	broadcaster          *pushtx.Broadcaster
 	banStore             banman.Store
 	workManager          *query.WorkManager
+	queryAccess          query.QueryAccess
 
 	peerSubscribers []*peerSubscription
 
@@ -736,6 +737,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	s.workManager = query.New(&query.Config{
 		ConnectedPeers: s.ConnectedPeers,
 	})
+	s.queryAccess = s.workManager
 
 	// We set the queryPeers method to point to queryChainServicePeers,
 	// passing a reference to the newly created ChainService.

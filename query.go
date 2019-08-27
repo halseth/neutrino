@@ -16,6 +16,7 @@ import (
 	"github.com/lightninglabs/neutrino/cache"
 	"github.com/lightninglabs/neutrino/filterdb"
 	"github.com/lightninglabs/neutrino/pushtx"
+	"github.com/lightninglabs/neutrino/query"
 )
 
 var (
@@ -595,18 +596,10 @@ func (s *ChainService) prepareCFiltersQuery(blockHash chainhash.Hash,
 		startHeight = int64(height)
 		stopHeight = startHeight + wire.MaxGetCFiltersReqRange - 1
 
-		// We need a longer timeout, since we are going to receive more
-		// than a single response.
-		options = append(options, Timeout(QueryBatchTimeout))
-
 	// Reverse batch, fetch as many of the preceding filters as possible.
 	case reverseBatch:
 		stopHeight = int64(height)
 		startHeight = stopHeight - wire.MaxGetCFiltersReqRange + 1
-
-		// We need a longer timeout, since we are going to receive more
-		// than a single response.
-		options = append(options, Timeout(QueryBatchTimeout))
 	}
 
 	// Block 1 is the earliest one we can fetch.
@@ -692,24 +685,24 @@ func (s *ChainService) prepareCFiltersQuery(blockHash chainhash.Hash,
 // handleCFiltersRespons is called every time we receive a response for the
 // GetCFilters request.
 func (s *ChainService) handleCFiltersResponse(q *cfiltersQuery,
-	resp wire.Message, quit chan<- struct{}) {
+	resp wire.Message) (bool, bool) {
 
 	// We're only interested in "cfilter" messages.
 	response, ok := resp.(*wire.MsgCFilter)
 	if !ok {
-		return
+		return false, false
 	}
 
 	// If the response doesn't match our request, ignore this message.
 	if q.filterType != response.FilterType {
-		return
+		return false, false
 	}
 
 	// If this filter is for a block not in our index, we can ignore it, as
 	// we either already got it, or it is out of our queried range.
 	i, ok := q.headerIndex[response.BlockHash]
 	if !ok {
-		return
+		return false, false
 	}
 
 	gotFilter, err := gcs.FromNBytes(
@@ -717,7 +710,7 @@ func (s *ChainService) handleCFiltersResponse(q *cfiltersQuery,
 	)
 	if err != nil {
 		// Malformed filter data. We can ignore this message.
-		return
+		return false, false
 	}
 
 	// Now that we have a proper filter, ensure that re-calculating the
@@ -729,11 +722,11 @@ func (s *ChainService) handleCFiltersResponse(q *cfiltersQuery,
 		gotFilter, prevHeader,
 	)
 	if err != nil {
-		return
+		return false, false
 	}
 
 	if gotHeader != curHeader {
-		return
+		return false, false
 	}
 
 	// At this point, the filter matches what we know about it and we
@@ -785,8 +778,11 @@ func (s *ChainService) handleCFiltersResponse(q *cfiltersQuery,
 	// If the headerIndex is empty, we got everything we wanted, and can
 	// exit.
 	if len(q.headerIndex) == 0 {
-		close(quit)
+		close(q.filterChan)
+		return true, true
 	}
+
+	return false, true
 }
 
 // GetCFilter gets a cfilter from the database. Failing that, it requests the
@@ -828,57 +824,45 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 	// We acquire the mutex ensuring we don't have several redundant
 	// CFilter queries running in parallel.
 	s.mtxCFilter.Lock()
+	defer s.mtxCFilter.Unlock()
 
 	// Since another request might have added the filter to the cache while
 	// we were waiting for the mutex, we do a final lookup before starting
 	// our own query.
 	filter, err = s.getFilterFromCache(&blockHash, dbFilterType)
 	if err == nil && filter != nil {
-		s.mtxCFilter.Unlock()
 		return filter, nil
 	}
 	if err != nil && err != cache.ErrElementNotFound {
-		s.mtxCFilter.Unlock()
 		return nil, err
 	}
 
 	// We didn't get the filter from the DB, so we'll try to get it from
 	// the network.
-	query, err := s.prepareCFiltersQuery(blockHash, filterType, options...)
+	cfQuery, err := s.prepareCFiltersQuery(blockHash, filterType, options...)
 	if err != nil {
-		s.mtxCFilter.Unlock()
 		return nil, err
 	}
 
 	// With all the necessary items retrieved, we'll launch our concurrent
 	// query to the set of connected peers.
 	log.Debugf("Fetching filters for heights=[%v, %v], stophash=%v",
-		query.startHeight, query.stopHeight, query.stopHash)
+		cfQuery.startHeight, cfQuery.stopHeight, cfQuery.stopHash)
 
-	go func() {
-		defer s.mtxCFilter.Unlock()
-		defer close(query.filterChan)
-
-		s.queryPeers(
-			// Send a wire.MsgGetCFilters
-			query.queryMsg(),
-
-			// Check responses and if we get one that matches, end
-			// the query early.
-			func(_ *ServerPeer, resp wire.Message, quit chan<- struct{}) {
-				s.handleCFiltersResponse(query, resp, quit)
+	msgs := []*query.Query{
+		&query.Query{
+			Req: cfQuery.queryMsg(),
+			HandleResp: func(_, resp wire.Message, _ string) (bool, bool) {
+				return s.handleCFiltersResponse(cfQuery, resp)
 			},
-			query.options...,
-		)
+		},
+	}
 
-		// If there are elements left to receive, the query failed.
-		if len(query.headerIndex) > 0 {
-			numFilters := query.stopHeight - query.startHeight + 1
-			log.Errorf("Query failed with %d out of %d filters "+
-				"received", len(query.headerIndex), numFilters)
-			return
-		}
-	}()
+	// Translate options to query.QueryOption type, and hand the queries to
+	// the work manager.
+	errChan := s.queryAccess.Query(
+		msgs, translateQueryOptions(options...)...,
+	)
 
 	var ok bool
 	var resultFilter *gcs.Filter
@@ -888,7 +872,7 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 	for {
 		select {
 
-		case filter, ok = <-query.filterChan:
+		case filter, ok = <-cfQuery.filterChan:
 			if !ok {
 				// Query has finished, if we have a result we'll return it.
 				return resultFilter, nil
@@ -897,12 +881,27 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 			// We'll store the filter so we can return it later to the caller.
 			resultFilter = filter
 
+		case err := <-errChan:
+			log.Errorf("Query failed: %v", err)
+			return nil, err
 		case <-s.quit:
 			// TODO(halseth): return error?
 			return nil, nil
 		}
 	}
 
+}
+
+// translateQueryOptions to query.QueryOption type.
+// TODO(halseth): remove when all queries go through work manager.
+func translateQueryOptions(options ...QueryOption) []query.QueryOption {
+	qo := defaultQueryOptions()
+	qo.applyQueryOptions(options...)
+
+	var qOpt []query.QueryOption
+	qOpt = append(qOpt, query.Timeout(qo.timeout))
+	qOpt = append(qOpt, query.Encoding(qo.encoding))
+	return qOpt
 }
 
 // GetBlock gets a block by requesting it from the network, one peer at a
@@ -936,7 +935,7 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	// If the block is already in the cache, we can return it immediately.
 	blockValue, err := s.BlockCache.Get(*inv)
 	if err == nil && blockValue != nil {
-		return blockValue.(*cache.CacheableBlock).Block, err
+		return blockValue.(*cache.CacheableBlock).Block, nil
 	}
 	if err != nil && err != cache.ErrElementNotFound {
 		return nil, err
@@ -950,28 +949,17 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	// which is always called single-threadedly. We don't check the block
 	// until after the query is finished, so we can just write to it
 	// naively.
-	var foundBlock *btcutil.Block
-	s.queryPeers(
-		// Send a wire.GetDataMsg
-		getData,
+	foundBlock := make(chan *btcutil.Block, 1)
 
-		// Check responses and if we get one that matches, end the
-		// query early.
-		func(sp *ServerPeer, resp wire.Message,
-			quit chan<- struct{}) {
+	q := &query.Query{
+		Req: getData,
+		HandleResp: func(_, resp wire.Message, peerAddr string) (bool, bool) {
 			switch response := resp.(type) {
 			// We're only interested in "block" messages.
 			case *wire.MsgBlock:
-				// Only keep this going if we haven't already
-				// found a block, or we risk closing an already
-				// closed channel.
-				if foundBlock != nil {
-					return
-				}
-
 				// If this isn't our block, ignore it.
 				if response.BlockHash() != blockHash {
-					return
+					return false, false
 				}
 				block := btcutil.NewBlock(response)
 
@@ -996,9 +984,9 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 					log.Warnf("Invalid block for %s "+
 						"received from %s -- "+
 						"disconnecting peer", blockHash,
-						sp.Addr())
-					sp.Disconnect()
-					return
+						peerAddr)
+					s.DisconnectNodeByAddr(peerAddr)
+					return false, false
 				}
 
 				// TODO(roasbeef): modify CheckBlockSanity to
@@ -1008,25 +996,44 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 				// know about it and we declare it sane. We can
 				// kill the query and pass the response back to
 				// the caller.
-				foundBlock = block
-				close(quit)
+				foundBlock <- block
+				return true, true
 			default:
+				return false, false
 			}
+
 		},
-		options...,
+	}
+
+	msgs := []*query.Query{q}
+	errChan := s.queryAccess.Query(
+		msgs, translateQueryOptions(options...)...,
 	)
-	if foundBlock == nil {
-		return nil, fmt.Errorf("Couldn't retrieve block %s from "+
-			"network", blockHash)
+
+	var block *btcutil.Block
+
+Loop:
+	// Wait for the block, or an error to occur.
+	for {
+		select {
+		case block = <-foundBlock:
+			break Loop
+		case err := <-errChan:
+			if err != nil {
+				return nil, err
+			}
+		case <-s.quit:
+			return nil, fmt.Errorf("ChainService shutting down")
+		}
 	}
 
 	// Add block to the cache before returning it.
-	_, err = s.BlockCache.Put(*inv, &cache.CacheableBlock{foundBlock})
+	_, err = s.BlockCache.Put(*inv, &cache.CacheableBlock{block})
 	if err != nil {
 		log.Warnf("couldn't write block to cache: %v", err)
 	}
 
-	return foundBlock, nil
+	return block, nil
 }
 
 // sendTransaction sends a transaction to all peers. It returns an error if any
