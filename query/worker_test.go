@@ -386,3 +386,57 @@ func TestWorkerProgress(t *testing.T) {
 		t.Fatalf("got result for unexpected job")
 	}
 }
+
+// TestJobCanceled tests that the worker will return an error if the job is
+// canceled while the worker is handling it.
+func TestJobCanceled(t *testing.T) {
+	t.Parallel()
+
+	ctx, err := startWorker()
+	if err != nil {
+		t.Fatalf("unable to start worker: %v", err)
+	}
+
+	nextJob := ctx.nextJob
+	jobResults := ctx.jobResults
+	peer := ctx.peer
+
+	cancelChan := make(chan struct{})
+
+	// Give the worker a new job.
+	task := makeTask()
+	task.options.cancelChan = cancelChan
+
+	select {
+	case nextJob <- task:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("did not pick up job")
+	}
+
+	// The request should be given to the peer.
+	select {
+	case <-peer.requests:
+	case <-time.After(time.Second):
+		t.Fatalf("request not sent")
+	}
+
+	// Cancel the job.
+	close(cancelChan)
+
+	// The worker should respond with a job failure.
+	var result *jobResult
+	select {
+	case result = <-jobResults:
+	case <-time.After(time.Second):
+		t.Fatalf("response not received")
+	}
+
+	if result.err != ErrJobCanceled {
+		t.Fatalf("expected job canceled, got: %v", result.err)
+	}
+
+	// Make sure the result was given for the intended task.
+	if result.task != task {
+		t.Fatalf("got result for unexpected job")
+	}
+}

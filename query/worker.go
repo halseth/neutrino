@@ -15,6 +15,10 @@ var (
 	// ErrPeerDisconnected is returned if the worker's peer disconnect
 	// before the query has been answered.
 	ErrPeerDisconnected = errors.New("peer disconnected")
+
+	// ErrJobCanceled is returned if the job is canceled before the query
+	// has been answered.
+	ErrJobCanceled = errors.New("job canceled")
 )
 
 // queryTask is the internal struct that wraps the Query to work on, in
@@ -89,10 +93,17 @@ func (w *worker) run() {
 			return
 		}
 
-		// We received a query job, send it to the peer.
-		w.peer.QueueMessageWithEncoding(
-			job.Req, nil, job.options.encoding,
-		)
+		select {
+		// There is no point in queieing the request if the job already
+		// is canceled, so we check this quickly.
+		case <-job.options.cancelChan:
+
+		// We received a non-canceled query job, send it to the peer.
+		default:
+			w.peer.QueueMessageWithEncoding(
+				job.Req, nil, job.options.encoding,
+			)
+		}
 
 		// Wait for the correct response to be received from the peer,
 		// or an error happening.
@@ -151,6 +162,12 @@ func (w *worker) run() {
 					"cancelling task", w.peer.Addr())
 
 				jobErr = ErrPeerDisconnected
+				break Loop
+
+			// If the job was canceled, we report this back to the
+			// work manager.
+			case <-job.options.cancelChan:
+				jobErr = ErrJobCanceled
 				break Loop
 
 			case <-w.quit:
