@@ -254,3 +254,91 @@ func TestWorkManagerWorkDispatcherFailures(t *testing.T) {
 		t.Fatalf("nothing received on errChan")
 	}
 }
+
+// TestWorkManagerCancelBatch checks that we can cancel a batch query midway,
+// and that the jobs it contains are canceled.
+func TestWorkManagerCancelBatch(t *testing.T) {
+	const numQueries = 100
+
+	nextJob := make(chan *queryTask)
+	responses := make(chan *jobResult)
+
+	// Start the workDispatcher goroutine.
+	wm := New(&Config{})
+	wm.wg.Add(1)
+	go wm.workDispatcher(nextJob, responses)
+
+	// Schedule a batch of queries.
+	var queries []*Query
+	for i := 0; i < numQueries; i++ {
+		q := &Query{}
+		queries = append(queries, q)
+	}
+
+	// Send the query, and include a channel to cancel the batch.
+	cancelChan := make(chan struct{})
+	errChan := wm.Query(queries, Cancel(cancelChan))
+
+	// Respond with a result to half of the queries.
+	for i := 0; i < numQueries/2; i++ {
+		var job *queryTask
+		select {
+		case job = <-nextJob:
+		case <-errChan:
+			t.Fatalf("did not expect on errChan")
+		case <-time.After(time.Second):
+			t.Fatalf("next job not received")
+		}
+
+		// Respond with a success result.
+		select {
+		case responses <- &jobResult{
+			task: job,
+			err:  nil,
+		}:
+		case <-errChan:
+			t.Fatalf("did not expect on errChan")
+		case <-time.After(time.Second):
+			t.Fatalf("result not handled")
+		}
+	}
+
+	// Cancel the batch.
+	close(cancelChan)
+
+	// All remaining queries should be canceled.
+	for i := 0; i < numQueries/2; i++ {
+		var job *queryTask
+		select {
+		case job = <-nextJob:
+		case <-time.After(time.Second):
+			t.Fatalf("next job not received")
+		}
+
+		select {
+		case <-job.options.cancelChan:
+		case <-time.After(time.Second):
+			t.Fatalf("job not canceled")
+		}
+
+		select {
+		case responses <- &jobResult{
+			task: job,
+			err:  ErrJobCanceled,
+		}:
+		case <-time.After(time.Second):
+			t.Fatalf("result not handled")
+		}
+
+	}
+
+	// The query should exit with an error.
+	select {
+	case err := <-errChan:
+		if err != ErrJobCanceled {
+			t.Fatalf("expected ErrJobCanceled, got : %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("nothing received on errChan")
+	}
+}

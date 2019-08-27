@@ -211,37 +211,61 @@ func (w *WorkManager) workDispatcher(nextJob chan<- *queryTask,
 
 		}
 
-		// If we had new result, inspect the result.
+		// If we had a new result, inspect the result.
 		if result != nil {
+			// Get the index of this query's batch, and delete it
+			// from the map of current queries, since we don't have
+			// to track it anymore.
+			batchNum := currentQueries[result.task.index]
+			delete(currentQueries, result.task.index)
+
 			switch {
-			// If the query task ended with a failure, put it back
-			// into the work queue.
 			case result.err != nil:
-				log.Warnf("Query(%d) failed with error: %v. "+
-					"Rescheduling", result.task.index,
-					result.err)
-				heap.Push(work, result.task)
+				switch {
+				// If the query task ended because it was
+				// canceled, drop it.
+				case result.err == ErrJobCanceled:
+					log.Warnf("Query(%d) was canceled "+
+						"before result was available",
+						result.task.index)
+
+					// If this is the first job in this
+					// batch that was canceled, forward the
+					// error on the batch's error channel.
+					// We do this since a cancellation
+					// applies to the whole batch.
+					b, ok := currentBatches[batchNum]
+					if ok {
+						b.errChan <- result.err
+						delete(currentBatches, batchNum)
+					}
+
+				// If the query task ended with any other
+				// error, put it back into the work queue.
+				default:
+					log.Warnf("Query(%d) failed with "+
+						"error: %v. Rescheduling",
+						result.task.index, result.err)
+					heap.Push(work, result.task)
+					currentQueries[result.task.index] = batchNum
+				}
 
 			// Otherwise we update the status of the batch this
 			// query is a part of.
 			default:
-				// Get the index of this query's batch, and
-				// delete it from the map, since we don't have
-				// to track it anymore.
-				batchNum := currentQueries[result.task.index]
-				delete(currentQueries, result.task.index)
-
 				// Get the batch and decrement the number of
 				// queries remaining.
-				b := currentBatches[batchNum]
-				b.rem--
+				b, ok := currentBatches[batchNum]
+				if ok {
+					b.rem--
 
-				// If this was the last query in flight for
-				// this batch, we can notify that it finished,
-				// and delete it.
-				if b.rem == 0 {
-					b.errChan <- nil
-					delete(currentBatches, batchNum)
+					// If this was the last query in flight
+					// for this batch, we can notify that
+					// it finished, and delete it.
+					if b.rem == 0 {
+						b.errChan <- nil
+						delete(currentBatches, batchNum)
+					}
 				}
 			}
 		}
