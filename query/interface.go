@@ -34,6 +34,10 @@ type queryOptions struct {
 	// encoding lets the query know which encoding to use when queueing
 	// messages to a peer.
 	encoding wire.MessageEncoding
+
+	// cancelChan is an optional channel that can be closed to indicate
+	// that the query should be canceled.
+	cancelChan chan struct{}
 }
 
 // QueryOption is a functional option argument to any of the network query
@@ -48,6 +52,7 @@ func defaultQueryOptions() *queryOptions {
 		timeout:      defaultQueryTimeout,
 		peerCooldown: defaultQueryPeerCooldown,
 		encoding:     defaultQueryEncoding,
+		cancelChan:   nil,
 	}
 }
 
@@ -71,6 +76,14 @@ func Timeout(timeout time.Duration) QueryOption {
 func Encoding(encoding wire.MessageEncoding) QueryOption {
 	return func(qo *queryOptions) {
 		qo.encoding = encoding
+	}
+}
+
+// Cancel takes a channel that can be closed to indicate that the query should
+// be canceled.
+func Cancel(cancel chan struct{}) QueryOption {
+	return func(qo *queryOptions) {
+		qo.cancelChan = cancel
 	}
 }
 

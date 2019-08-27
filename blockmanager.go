@@ -1035,7 +1035,7 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 
 	// Hand the queries to the work manager, and consume the verified
 	// responses as they come back.
-	errChan := b.cfg.QueryAccess.Query(msgs)
+	errChan := b.cfg.QueryAccess.Query(msgs, query.Cancel(b.quit))
 	for i := 0; i < len(queryMsgs); i++ {
 		var r *wire.MsgCFHeaders
 		select {
