@@ -104,17 +104,19 @@ func (w *worker) Run(peer Peer, results chan<- *jobResult,
 Loop:
 	for {
 
+		log.Infof("Worker %v waiting for more work", peer.Addr())
+
 		select {
 		// Poll a new job from the nextJob channel.
 		case job := <-w.nextJob:
-			log.Tracef("Worker %v picked up job with index %v",
+			log.Infof("Worker %v picked up job with index %v",
 				peer.Addr(), job.Index())
 
 			select {
 			// There is no point in queueing the request if the job already
 			// is canceled, so we check this quickly.
 			case <-job.cancelChan:
-				log.Tracef("Worker %v found job with index %v "+
+				log.Infof("Worker %v found job with index %v "+
 					"already canceled", peer.Addr(), job.Index())
 				continue Loop
 
@@ -122,7 +124,7 @@ Loop:
 			}
 
 			// We received a non-canceled query job, send it to the peer.
-			log.Tracef("Worker %v queuing job %T with index %v",
+			log.Infof("Worker %v queuing job %T with index %v",
 				peer.Addr(), job.Req, job.Index())
 
 			peer.QueueMessageWithEncoding(job.Req, nil, job.encoding)
@@ -144,7 +146,7 @@ Loop:
 					job.Req, resp, peer.Addr(),
 				)
 
-				log.Tracef("Worker %v handled msg %T while "+
+				log.Infof("Worker %v handled msg %T while "+
 					"waiting for response to %T (job=%v). "+
 					"Finished=%v, progressed=%v",
 					peer.Addr(), resp, job.Req, job.Index(),
@@ -194,14 +196,14 @@ Loop:
 				// be given to someone else.
 				case <-job.timeout:
 					jobErr = ErrQueryTimeout
-					log.Tracef("Worker %v timeout for request %T "+
+					log.Infof("Worker %v timeout for request %T "+
 						"with job index %v", peer.Addr(),
 						job.Req, job.Index())
 
 				// If the job was canceled, we report this back to the
 				// work manager.
 				case <-job.cancelChan:
-					log.Tracef("Worker %v job %v canceled",
+					log.Infof("Worker %v job %v canceled",
 						peer.Addr(), job.Index())
 
 					jobErr = ErrJobCanceled

@@ -17,7 +17,7 @@ const (
 	maxQueryTimeout = 32 * time.Second
 
 	// TODO: must dynamically increase according to peer ranck
-	maxActiveJobs = 20
+	maxActiveJobs = 1
 )
 
 var (
@@ -202,6 +202,7 @@ func (w *WorkManager) workDispatcher() {
 
 Loop:
 	for {
+		log.Infof("checking work queue for work")
 		// If the work queue is non-empty, we'll take out the first
 		// element in order for distributing it to a worker.
 		if work.Len() > 0 {
@@ -219,6 +220,8 @@ Loop:
 				freeWorkers = append(freeWorkers, p)
 			}
 
+			log.Infof("found work and %d free workers!", len(freeWorkers))
+
 			// Use the historical data to rank them.
 			w.cfg.Ranking.Order(freeWorkers)
 
@@ -226,12 +229,14 @@ Loop:
 			// slots available.
 			for _, p := range freeWorkers {
 				r := workers[p]
+				log.Infof("sending job %v to worker %v",
+					next.Index(), p)
 
 				// The worker has free work slots, it should
 				// pick up the query.
 				select {
 				case r.w.NewJob() <- next:
-					log.Tracef("Sent job %v to worker %v",
+					log.Infof("Sent job %v to worker %v",
 						next.Index(), p)
 					heap.Pop(work)
 					r.activeJobs[next.Index()] = next
@@ -240,6 +245,10 @@ Loop:
 					// if there are more jobs to
 					// distribute.
 					continue Loop
+
+					//					// TODO: hack, might not work
+					//				default:
+					//				}
 
 				// Remove workers no longer active.
 				case <-r.onExit:
@@ -287,7 +296,7 @@ Loop:
 
 		// A new result came back.
 		case result := <-w.jobResults:
-			log.Tracef("Result for job %v received. err=%v",
+			log.Infof("Result for job %v received. err=%v",
 				result.job.index, result.err)
 
 			// Delete the job from the worker's active job, such
@@ -310,7 +319,7 @@ Loop:
 				// If the query ended because it was canceled,
 				// drop it.
 				case result.err == ErrJobCanceled:
-					log.Tracef("Query(%d) was canceled "+
+					log.Infof("Query(%d) was canceled "+
 						"before result was available",
 						result.job.index)
 
@@ -365,7 +374,7 @@ Loop:
 				// the batch.
 				if batch != nil {
 					batch.rem--
-					log.Tracef("Remaining jobs for batch "+
+					log.Infof("Remaining jobs for batch "+
 						"%v: %v ", batchNum, batch.rem)
 
 					// If this was the last query in flight
@@ -375,7 +384,7 @@ Loop:
 						batch.errChan <- nil
 						delete(currentBatches, batchNum)
 
-						log.Tracef("Batch %v done",
+						log.Infof("Batch %v done",
 							batchNum)
 						continue Loop
 					}
