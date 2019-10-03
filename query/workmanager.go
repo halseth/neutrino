@@ -15,6 +15,9 @@ const (
 
 	// maxQueryTimeout is the maximum timeout given to a single query.
 	maxQueryTimeout = 32 * time.Second
+
+	// TODO: must dynamically increase according to peer ranck
+	maxActiveJobs = 20
 )
 
 var (
@@ -74,9 +77,9 @@ type PeerRanking interface {
 // we have given to it.
 // TODO(halseth): support more than one active job at a time.
 type activeWorker struct {
-	w         Worker
-	activeJob *queryJob
-	onExit    chan struct{}
+	w          Worker
+	activeJobs map[uint64]*queryJob
+	onExit     chan struct{}
 }
 
 // Config holds the configuration options for a new WorkManager.
@@ -209,7 +212,7 @@ Loop:
 			for p, r := range workers {
 				// Only one active job at a time is currently
 				// supported.
-				if r.activeJob != nil {
+				if len(r.activeJobs) == maxActiveJobs {
 					continue
 				}
 
@@ -231,7 +234,7 @@ Loop:
 					log.Tracef("Sent job %v to worker %v",
 						next.Index(), p)
 					heap.Pop(work)
-					r.activeJob = next
+					r.activeJobs[next.Index()] = next
 
 					// Go back to start of loop, to check
 					// if there are more jobs to
@@ -267,9 +270,9 @@ Loop:
 			// remove it from our set of active workers.
 			onExit := make(chan struct{})
 			workers[peer.Addr()] = &activeWorker{
-				w:         r,
-				activeJob: nil,
-				onExit:    onExit,
+				w:          r,
+				activeJobs: make(map[uint64]*queryJob),
+				onExit:     onExit,
 			}
 
 			w.cfg.Ranking.AddPeer(peer.Addr())
@@ -291,7 +294,7 @@ Loop:
 			// that the slot gets opened for more work.
 			r, ok := workers[result.peer.Addr()]
 			if ok {
-				r.activeJob = nil
+				delete(r.activeJobs, result.job.index)
 			}
 
 			// Get the index of this query's batch, and delete it

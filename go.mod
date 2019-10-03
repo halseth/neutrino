@@ -9,6 +9,7 @@ require (
 	github.com/btcsuite/btcwallet/wtxmgr v1.0.0
 	github.com/davecgh/go-spew v1.1.1
 	github.com/lightningnetwork/lnd/queue v1.0.1
+	github.com/lightningnetwork/lnd/ticker v1.0.0
 )
 
 go 1.13

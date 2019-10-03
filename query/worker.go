@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
+	"github.com/lightningnetwork/lnd/ticker"
 )
 
 var (
@@ -40,6 +41,11 @@ var _ Task = (*queryJob)(nil)
 // NOTE: Part of the Task interface.
 func (q *queryJob) Index() uint64 {
 	return q.index
+}
+
+type activeJob struct {
+	timeout <-chan time.Time
+	*queryJob
 }
 
 // jobResult is the final result of the worker's handling of the queryJob.
@@ -85,63 +91,55 @@ func (w *worker) Run(peer Peer, results chan<- *jobResult,
 	msgChan, cancel := peer.SubscribeRecvMsg()
 	defer cancel()
 
-	for {
-		log.Tracef("Worker %v waiting for more work", peer.Addr())
+	// Wait for the correct response to be received from the peer,
+	// or an error happening.
+	var (
+		jobs          = make(map[uint64]*activeJob)
+		timeoutTicker = ticker.New(1 * time.Second)
+	)
 
-		var job *queryJob
+	timeoutTicker.Resume()
+	defer timeoutTicker.Stop()
+
+Loop:
+	for {
+
 		select {
 		// Poll a new job from the nextJob channel.
-		case job = <-w.nextJob:
+		case job := <-w.nextJob:
 			log.Tracef("Worker %v picked up job with index %v",
 				peer.Addr(), job.Index())
 
-		// Ignore any message received while not working on anything.
-		case msg := <-msgChan:
-			log.Tracef("Worker %v ignoring received msg %T "+
-				"since no job active", peer.Addr(), msg)
-			continue
+			select {
+			// There is no point in queueing the request if the job already
+			// is canceled, so we check this quickly.
+			case <-job.cancelChan:
+				log.Tracef("Worker %v found job with index %v "+
+					"already canceled", peer.Addr(), job.Index())
+				continue Loop
 
-		// If the peer disconnected, we can exit immediately, as we
-		// weren't working on a query.
-		case <-peer.OnDisconnect():
-			log.Debugf("Peer %v for worker disconnected",
-				peer.Addr())
-			return
+			default:
+			}
 
-		case <-quit:
-			return
-		}
-
-		select {
-		// There is no point in queueing the request if the job already
-		// is canceled, so we check this quickly.
-		case <-job.cancelChan:
-			log.Tracef("Worker %v found job with index %v "+
-				"already canceled", peer.Addr(), job.Index())
-
-		// We received a non-canceled query job, send it to the peer.
-		default:
+			// We received a non-canceled query job, send it to the peer.
 			log.Tracef("Worker %v queuing job %T with index %v",
 				peer.Addr(), job.Req, job.Index())
 
 			peer.QueueMessageWithEncoding(job.Req, nil, job.encoding)
-		}
 
-		// Wait for the correct response to be received from the peer,
-		// or an error happening.
-		var (
-			resp    wire.Message
-			jobErr  error
-			timeout = time.After(job.timeout)
-		)
+			jobs[job.Index()] = &activeJob{
+				timeout:  time.After(job.timeout),
+				queryJob: job,
+			}
 
-	Loop:
-		for {
-			select {
-			// A message was received from the peer, use the
-			// response handler to check whether it was answering
-			// our request.
-			case resp = <-msgChan:
+		// A message was received from the peer, use the
+		// response handler to check whether it was answering
+		// our request.
+		case resp := <-msgChan:
+			// TODO: optimize by assuming in-order replies are common?
+			// can possibly also require i to be handled before
+			// handling i+1, but must avoid deadlocks.
+			for i, job := range jobs {
 				progress := job.HandleResp(
 					job.Req, resp, peer.Addr(),
 				)
@@ -163,69 +161,93 @@ func (w *worker) Run(peer Peer, results chan<- *jobResult,
 					// TODO(halseth): separete progress
 					// timeout value.
 					if progress.Progressed {
-						timeout = time.After(
-							job.timeout,
+						job.timeout = time.After(
+							job.queryJob.timeout,
 						)
 					}
 					continue Loop
 				}
 
-				// We did get a valid response, and can break
-				// the loop.
-				break Loop
+				delete(jobs, i)
 
-			// If the timeout is reached before a valid response
-			// has been received, we exit with an error.
-			case <-timeout:
+				// We have a result ready for the query, hand it off before
+				// getting a new job.
+				select {
+				case results <- &jobResult{
+					job:  job.queryJob,
+					peer: peer,
+					err:  nil,
+				}:
+				case <-quit:
+					return
+				}
+			}
+
+		// If the timeout is reached before a valid response
+		// has been received, we exit with an error.
+		case <-timeoutTicker.Ticks():
+			for i, job := range jobs {
+				var jobErr error
+				select {
+
 				// The query did experience a timeout and will
 				// be given to someone else.
-				jobErr = ErrQueryTimeout
-				log.Tracef("Worker %v timeout for request %T "+
-					"with job index %v", peer.Addr(),
-					job.Req, job.Index())
+				case <-job.timeout:
+					jobErr = ErrQueryTimeout
+					log.Tracef("Worker %v timeout for request %T "+
+						"with job index %v", peer.Addr(),
+						job.Req, job.Index())
 
-				break Loop
+				// If the job was canceled, we report this back to the
+				// work manager.
+				case <-job.cancelChan:
+					log.Tracef("Worker %v job %v canceled",
+						peer.Addr(), job.Index())
 
-			// If the peer disconnectes before giving us a valid
-			// answer, we'll also exit with an error.
-			case <-peer.OnDisconnect():
-				log.Debugf("Peer %v for worker disconnected, "+
-					"cancelling job %v", peer.Addr(),
-					job.Index())
+					jobErr = ErrJobCanceled
 
-				jobErr = ErrPeerDisconnected
-				break Loop
+				default:
+					continue
+				}
 
-			// If the job was canceled, we report this back to the
-			// work manager.
-			case <-job.cancelChan:
-				log.Tracef("Worker %v job %v canceled",
-					peer.Addr(), job.Index())
+				delete(jobs, i)
 
-				jobErr = ErrJobCanceled
-				break Loop
-
-			case <-quit:
-				return
+				// We have a result ready for the query, hand it off before
+				// getting a new job.
+				select {
+				case results <- &jobResult{
+					job:  job.queryJob,
+					peer: peer,
+					err:  jobErr,
+				}:
+				case <-quit:
+					return
+				}
 			}
-		}
 
-		// We have a result ready for the query, hand it off before
-		// getting a new job.
-		select {
-		case results <- &jobResult{
-			job:  job,
-			peer: peer,
-			err:  jobErr,
-		}:
-		case <-quit:
+		// If the peer disconnectes before giving us a valid
+		// answer, we'll also exit with an error.
+		case <-peer.OnDisconnect():
+			log.Debugf("Peer %v for worker disconnected, "+
+				"cancelling %d jobs", peer.Addr(),
+				len(jobs))
+
+			for _, job := range jobs {
+				select {
+				case results <- &jobResult{
+					job:  job.queryJob,
+					peer: peer,
+					err:  ErrPeerDisconnected,
+				}:
+				case <-quit:
+					return
+				}
+			}
+
+			// If the peer disconnected, we can exit immediately.
 			return
-		}
 
-		// If the peer disconnected, we can exit immediately.
-		if jobErr == ErrPeerDisconnected {
-			log.Debugf("Peer %v for worker disconnected, exiting",
-				peer.Addr())
+		case <-quit:
 			return
 		}
 	}
