@@ -3,7 +3,6 @@ package query
 import (
 	"container/heap"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -131,20 +130,8 @@ func New(cfg *Config) *WorkManager {
 
 // Start starts the WorkManager.
 func (w *WorkManager) Start() error {
-
-	// Get a peer subscription.
-	peersConnected, cancel, err := w.cfg.ConnectedPeers()
-	if err != nil {
-		return fmt.Errorf("Unable to get connected peers: %v", err)
-	}
-
 	w.wg.Add(1)
-	go func() {
-		defer w.wg.Done()
-		defer cancel()
-
-		w.workDispatcher(peersConnected)
-	}()
+	go w.workDispatcher()
 
 	return nil
 }
@@ -161,7 +148,21 @@ func (w *WorkManager) Stop() error {
 // callers, and dispatches these to active workers.  It makes sure to
 // prioritize the queries in the order they come in, such that early queries
 // will be attemped completed first.
-func (w *WorkManager) workDispatcher(peersConnected <-chan Peer) {
+//
+// NOTE: MUST be run as a goroutine.
+func (w *WorkManager) workDispatcher() {
+	defer w.wg.Done()
+
+	// Get a peer subscription. We do it in this goroutine rather than
+	// Start to avoid a deadlock when starting the WorkManager fetches the
+	// peers from the server.
+	peersConnected, cancel, err := w.cfg.ConnectedPeers()
+	if err != nil {
+		log.Errorf("Unable to get connected peers: %v", err)
+		return
+	}
+	defer cancel()
+
 	// Init a work queue which will be used to sort the incoming queries in
 	// a first come first served fashion. We use a heap structure such
 	// that we can efficiently put failed queries back in the queue.
